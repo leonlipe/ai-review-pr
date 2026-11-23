@@ -108,9 +108,9 @@ pick_account() {
 repo=""; pr=""; mode="interactive"; out=""; here=0; clean=0; list=0; setup=""
 account=""; list_accounts=0
 cmd="review"; event="comment"; regen=0; edit=0; yes=0
-if [ "${1:-}" = "push-comment" ]; then cmd="push"; shift; fi
 while [ $# -gt 0 ]; do
   case "$1" in
+    push-comment)      cmd="push"; shift ;;
     --comment)         event="comment"; shift ;;
     --approve)         event="approve"; shift ;;
     --request-changes) event="request-changes"; shift ;;

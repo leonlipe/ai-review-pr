@@ -10,6 +10,8 @@ It installs three things:
 | `/review-pr` command | `~/.claude/commands/review-pr.md` | `/review-pr 123` inside Claude. Limits Claude to read-only `gh`/`git` commands. |
 | `review-pr` CLI | `~/.local/bin/review-pr` | Fetches the PR into a separate git worktree and starts Claude there. |
 
+Paths shown use the default `~/.claude`. With several Claude accounts, the skill and command go into each account's config dir (e.g. `~/.claude-vo`). See [Multiple Claude accounts](#6-multiple-claude-accounts).
+
 The full design rationale is in [PROCESS.md](PROCESS.md).
 
 ---
@@ -30,19 +32,30 @@ cd ~/development/ai/review-process
 ./install.sh
 ```
 
-The installer copies files (it backs up any existing file it would overwrite as `*.bak`), checks your dependencies, and warns if `~/.local/bin` isn't on your `PATH`.
+With several Claude accounts (`~/.claude`, `~/.claude-vo`, `~/.claude-personal`, ...):
+
+```bash
+./install.sh --list-accounts                    # see what's detected
+./install.sh --all-accounts --link              # install for all of them
+git config --global review-pr.account personal  # account review-pr uses by default
+```
+
+The installer copies files, checks your dependencies, and warns if `~/.local/bin` isn't on your `PATH`. Before overwriting a file that differs, it saves the old one as `*.bak` next to it. To restore an old version, rename the `.bak` file back (e.g. `mv SKILL.md.bak SKILL.md`). Otherwise, delete it once you no longer need it.
 
 | Command | Effect |
 |---|---|
-| `./install.sh` | Global install (skill + command + CLI) |
-| `./install.sh --link` | Same, using symlinks so edits in this repo apply immediately |
+| `./install.sh` | Global install (skill + command + CLI) for the current account |
+| `./install.sh -a vo -a personal` | Install for specific Claude accounts (see [Multiple accounts](#6-multiple-claude-accounts)) |
+| `./install.sh --all-accounts` | Install for every detected account |
+| `./install.sh --list-accounts` | Show detected accounts and where it's installed |
+| `--link` (add to any of the above) | Use symlinks instead of copies, so edits in this repo apply immediately |
 | `./install.sh --no-cli` | Skill and command only |
 | `./install.sh --project <repo>` | Copy skill and command into `<repo>/.claude/` so you can commit them for your team |
 | `./install.sh --init-standards <repo>` | Create `.claude/review-standards.md` and `CLAUDE.md` templates in a repo |
 | `./install.sh --init-standards <repo> --private` | Same, and add them to `.git/info/exclude` so they're never committed (useful in forks) |
-| `./install.sh --uninstall` | Remove the global install |
+| `./install.sh --uninstall [-a NAME \| --all-accounts]` | Remove the install. The CLI stays while any account still uses it. |
 
-If you use a custom Claude config dir, the installer respects `CLAUDE_CONFIG_DIR`. You can override the CLI location with `BIN_DIR=/some/dir ./install.sh`.
+With no account flag, the installer targets `$CLAUDE_CONFIG_DIR` if it's set, otherwise `~/.claude`. If you name an account whose folder doesn't exist, the installer stops and asks you to log in to that account first. You can override the CLI location with `BIN_DIR=/some/dir ./install.sh`.
 
 Check that it worked: start `claude` in any repo and ask *"what skills do you have?"*. `pr-review` should be listed, and `/review-pr` should autocomplete.
 
@@ -85,8 +98,11 @@ review-pr -p 123                             # non-interactive: writes ~/pr-revi
 review-pr -p 123 -o ~/review.md              # custom output file
 review-pr --here 123                         # no worktree, same as /review-pr in the current dir
 review-pr -R owner/repo 123                  # force the repo that owns the PR
+review-pr -a vo 123                          # use a specific Claude account
+review-pr --accounts                         # show accounts and which one applies here
 review-pr --list                             # list open PRs in the resolved repo
 review-pr --clean 123                        # remove the worktree and refs
+review-pr push-comment 123                   # post the finished review (see below)
 ```
 
 > `--clean` uses `git worktree remove --force`, which deletes uncommitted changes in that review worktree. Don't keep work there.
@@ -99,15 +115,58 @@ Is blocking issue #1 really a bug? Show me a concrete input that breaks it.
 Write the review comments as I would post them on GitHub, concise and polite.
 ```
 
-### Posting the review
+### Posting the review: `review-pr push-comment`
 
-Claude never posts anything. Read and edit the review first, then post it yourself. **In a fork, always pass `--repo`:**
+Claude never posts anything. When you're happy with the review, post it yourself with one command:
 
 ```bash
-gh pr review 123 --repo owner/repo --comment         --body-file ~/pr-reviews/owner-repo-pr-123.md
-gh pr review 123 --repo owner/repo --request-changes --body-file ~/pr-reviews/owner-repo-pr-123.md
-gh pr review 123 --repo owner/repo --approve --body "LGTM"
+review-pr push-comment 123                     # post as a comment review
+review-pr push-comment 123 --request-changes   # block the merge
+review-pr push-comment 123 --approve           # approve
+review-pr push-comment 123 --edit              # open in $EDITOR first, then post
 ```
+
+**Where the text comes from:**
+
+1. `-f FILE`, if you pass it.
+2. Otherwise the default review file `~/pr-reviews/<owner>-<repo>-pr-123.md` (the one `review-pr -p` writes, or one you saved earlier).
+3. If that file doesn't exist but the review worktree does, it asks your **last Claude session in the worktree** for the final review (`claude -c -p`). The result includes any changes you asked for in follow-ups, such as *"drop nit #2"* or *"make it more polite"*. It's saved to the default file before posting, so you can check it. Use `--regenerate` to export again after more follow-ups.
+
+**Before posting**, it shows the target PR, the event, and a preview, then asks `Post this review? [y/N]`. It also warns when:
+
+- the event conflicts with Claude's verdict (e.g. `--approve` on a review that says *Request changes*)
+- this file was already posted (it keeps a `.posted` log next to the review file)
+- the PR isn't open
+
+It always passes `--repo`, so it posts to the right repo in forks, and prints the PR URL when done.
+
+**Typical flows:**
+
+```bash
+# Interactive: review, refine with follow-ups, exit Claude, then post
+review-pr 123
+review-pr push-comment 123 --request-changes
+
+# Non-interactive: generate, edit, post
+review-pr -p 123
+review-pr push-comment 123 --edit
+
+# Fully scripted (no confirmation prompt)
+review-pr -p 123 && review-pr push-comment 123 --yes
+```
+
+| Option | Effect |
+|---|---|
+| `--comment` / `--approve` / `--request-changes` | Review event (default `--comment`) |
+| `-f, --file FILE` | Post this file instead of the default one |
+| `--regenerate` | Export the review from the Claude session again, overwriting the file |
+| `-e, --edit` | Open the review in `$VISUAL`/`$EDITOR` before posting |
+| `-y, --yes` | Skip confirmation. Use with care; the warnings still print, but nothing stops the post. |
+| `-a NAME`, `-R owner/repo` | Same as for reviewing; `-a` picks the Claude account used to export from the session |
+
+> Read the review before you post it. Claude's output is a strong first pass, not the final reviewer. GitHub doesn't let you approve or request changes on your own PR; use `--comment` there.
+
+You can still post by hand with `gh pr review 123 --repo owner/repo --comment --body-file FILE`.
 
 ---
 
@@ -149,7 +208,66 @@ To give a team the whole setup without anyone running the installer, use `./inst
 
 ---
 
-## 6. Layout
+## 6. Multiple Claude accounts
+
+Claude Code keeps each account in its own config dir, selected with `CLAUDE_CONFIG_DIR`. A common setup uses shell aliases:
+
+```bash
+alias claude-personal='CLAUDE_CONFIG_DIR=~/.claude-personal command claude'
+alias claude-vo='CLAUDE_CONFIG_DIR=~/.claude-vo command claude'
+```
+
+Skills and commands are installed **per config dir**, so install into every account you'll review with.
+
+**Account names.** `-a NAME` resolves to `~/.claude-NAME`. `default` means `~/.claude`. You can also pass a path. Accounts are detected by scanning `~/.claude` and `~/.claude-*`.
+
+```bash
+./install.sh --list-accounts        # detected accounts + install status
+./install.sh --all-accounts --link  # install everywhere; edits here apply to all
+./install.sh -a vo                  # just one account
+```
+
+**Choosing the account in `review-pr`.** The first match wins:
+
+1. `-a/--account NAME`: one-off override
+2. `CLAUDE_CONFIG_DIR`: an exported env var (e.g. `CLAUDE_CONFIG_DIR=~/.claude-vo review-pr 123`)
+3. `git config review-pr.account NAME`: per repo, or `--global` for the machine default
+4. `~/.claude`
+
+Per-repo defaults fit the "work fork vs personal project" split well:
+
+```bash
+cd ~/work/client-fork && git config review-pr.account vo
+cd ~/oss/my-lib       && git config review-pr.account personal
+git config --global review-pr.account personal      # fallback everywhere else
+review-pr --accounts                                # shows which one applies here
+```
+
+> **Aliases don't reach scripts.** If `claude` is an alias for `claude-personal` in your shell, `review-pr` can't see it and would use `~/.claude`. Set `git config --global review-pr.account personal` (or export `CLAUDE_CONFIG_DIR`) so the CLI matches your alias.
+
+`review-pr` prints the account it's using and warns if `pr-review` isn't installed for that account. For `~/.claude` it leaves `CLAUDE_CONFIG_DIR` unset, because setting it would change where Claude looks for its login file (`~/.claude.json`).
+
+Inside Claude, `/review-pr` is only available in accounts where you installed it. Start the right one (`claude-vo`, ...) and it works the same way.
+
+### Multiple GitHub accounts
+
+Claude accounts and GitHub accounts are separate. `review-pr` and Claude call `gh` with whatever GitHub login is currently active. If work and personal PRs need different GitHub logins, use one of these:
+
+```bash
+# Option A: switch the active gh account (gh 2.40+ supports several logins)
+gh auth switch --user my-work-login
+review-pr 123
+
+# Option B: give each GitHub account its own gh config dir
+GH_CONFIG_DIR=~/.config/gh-work gh auth login   # once
+GH_CONFIG_DIR=~/.config/gh-work review-pr -a vo 123
+```
+
+For option B, you can pair the variables in an alias, e.g. `alias review-pr-vo='GH_CONFIG_DIR=~/.config/gh-work review-pr -a vo'`. The environment is passed through to Claude, so its `gh` calls use the same GitHub account.
+
+---
+
+## 7. Layout
 
 ```
 review-process/
@@ -165,19 +283,28 @@ review-process/
 
 To tune reviews, edit `skills/pr-review/SKILL.md` and re-run `./install.sh`. With `--link`, edits apply immediately.
 
-## 7. Tips
+## 8. Tips
 
 - **Big PRs:** review one area at a time (*"review only changes under src/api/"*). You get better results and use less of your plan.
 - **Usage limits:** Pro/Max limits are shared with claude.ai. Large reviews use more.
 - **Print mode permissions:** `claude -p` can only run tools listed in the command's `allowed-tools`. If a review needs more (for example running tests), add it there or use `--setup`.
 - **CI automation:** this flow is for running interactively on your machine. For CI, use an API key and check the current Claude Code terms.
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
 | `review-pr: command not found` | Add `~/.local/bin` to `PATH`, or reinstall with `BIN_DIR=...` |
 | `PR #N not found in: ...` | Use `-R owner/repo`, or add the `upstream` remote |
-| `/review-pr` missing in Claude | Check that `$CLAUDE_CONFIG_DIR/commands/review-pr.md` exists (default `~/.claude`), then restart `claude` |
+| `/review-pr` missing in Claude | That account doesn't have it installed. Run `./install.sh --list-accounts`, then `./install.sh -a NAME` and restart `claude` |
+| `review-pr` uses the wrong Claude account | Run `review-pr --accounts` to see which one applies and why. Shell aliases don't reach scripts, so set `git config --global review-pr.account NAME` or pass `-a NAME` |
+| `Claude config dir not found` | Typo in the account name, or you haven't logged in to it yet: `CLAUDE_CONFIG_DIR=~/.claude-NAME claude` |
+| `pr-review is not installed for this account` | `./install.sh -a NAME` (or `--all-accounts`) |
+| Claude asks you to log in again | Don't point `CLAUDE_CONFIG_DIR` at `~/.claude` (the default account keeps its login in `~/.claude.json`). Use `-a default` instead |
+| PR not found or permission errors with the right Claude account | The wrong **GitHub** login is active. Check `gh auth status` (see [Multiple GitHub accounts](#multiple-github-accounts)) |
 | `gh` auth errors | `gh auth status`, then `gh auth login` |
+| `push-comment`: `No review file ... and no review worktree` | Run the review first (`review-pr 123` or `review-pr -p 123`), or pass `-f FILE` |
+| `push-comment` posted an old version of the review | It reuses the saved file. After more follow-ups, use `--regenerate`, or `--edit` to fix it by hand |
+| `push-comment`: `no terminal to confirm` | Running from a script or CI. Add `--yes` |
+| `Can not approve your own pull request` | GitHub rule. Use `--comment` |
 | Worktree already exists | `review-pr N` reuses and updates it. Use `review-pr --clean N` to start fresh |

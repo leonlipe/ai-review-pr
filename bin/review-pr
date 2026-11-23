@@ -14,10 +14,15 @@ Usage:
   review-pr --here <pr>       Review from the current checkout (no worktree)
   review-pr --clean <pr>      Remove the worktree and refs for <pr>
   review-pr --list            List open PRs in the resolved repo
+  review-pr --accounts        List Claude accounts and which one would be used here
+  review-pr push-comment <pr> Post your finished review to the PR (asks to confirm)
 
 <pr> is a number, owner/repo#number, or a GitHub PR URL.
 
 Options:
+  -a, --account NAME|DIR  Claude account (config dir) to use. NAME → ~/.claude-NAME,
+                          "default" → ~/.claude. Precedence: --account >
+                          $CLAUDE_CONFIG_DIR > git config review-pr.account > ~/.claude
   -R, --repo OWNER/REPO   Repo that owns the PR (default: upstream remote, else origin)
   -p, --print             Non-interactive (claude -p); output goes to a file
   -o, --out FILE          Output file for -p (default: ~/pr-reviews/<owner>-<repo>-pr-<n>.md)
@@ -25,7 +30,22 @@ Options:
       --setup CMD         Run CMD in the worktree before reviewing (e.g. "npm ci")
   -h, --help              Show this help
 
-Env: CLAUDE_BIN (default: claude), REVIEW_PR_OUT_DIR (default: ~/pr-reviews)
+push-comment options:
+      --comment           Post as a comment review (default)
+      --approve           Post as an approval
+      --request-changes   Post as "request changes"
+  -f, --file FILE         Review file to post (default: the -p output file; if missing,
+                          the final review is exported from your last Claude session
+                          in the PR worktree)
+      --regenerate        Re-export from the Claude session even if the file exists
+  -e, --edit              Open the review in $EDITOR before posting
+  -y, --yes               Don't ask for confirmation
+
+Env: CLAUDE_BIN (default: claude), CLAUDE_CONFIG_DIR, REVIEW_PR_OUT_DIR (default: ~/pr-reviews)
+
+Default account per repo / globally:
+  git config review-pr.account vo            # this repo
+  git config --global review-pr.account personal
 USAGE
 }
 
@@ -46,9 +66,60 @@ remote_for_slug() {
   return 1
 }
 
+# --- Claude account helpers (kept in sync with install.sh) ---
+resolve_account() { # NAME|PATH -> config dir
+  case "$1" in
+    default)   echo "$HOME/.claude" ;;
+    */*|"~"*)  echo "${1/#\~/$HOME}" ;;
+    *)         echo "$HOME/.claude-$1" ;;
+  esac
+}
+account_name() { # config dir -> short name
+  case "$1" in
+    "$HOME/.claude")   echo "default" ;;
+    "$HOME"/.claude-*) echo "${1#"$HOME"/.claude-}" ;;
+    *)                 echo "$1" ;;
+  esac
+}
+detect_accounts() {
+  local d
+  for d in "$HOME/.claude" "$HOME"/.claude-*; do
+    [ -d "$d" ] || continue
+    if [ -e "$d/settings.json" ] || [ -e "$d/history.jsonl" ] || [ -e "$d/.claude.json" ] || [ -d "$d/projects" ]; then
+      echo "$d"
+    fi
+  done
+}
+# Sets claude_dir and claude_src. Precedence: --account > env > git config > default.
+pick_account() {
+  local a
+  if [ -n "$account" ]; then
+    claude_dir="$(resolve_account "$account")"; claude_src="--account"
+  elif [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    claude_dir="${CLAUDE_CONFIG_DIR/#\~/$HOME}"; claude_src="CLAUDE_CONFIG_DIR"
+  elif a="$(git config --get review-pr.account 2>/dev/null)" && [ -n "$a" ]; then
+    claude_dir="$(resolve_account "$a")"; claude_src="git config review-pr.account"
+  else
+    claude_dir="$HOME/.claude"; claude_src="default"
+  fi
+  claude_dir="${claude_dir%/}"
+}
+
 repo=""; pr=""; mode="interactive"; out=""; here=0; clean=0; list=0; setup=""
+account=""; list_accounts=0
+cmd="review"; event="comment"; regen=0; edit=0; yes=0
+if [ "${1:-}" = "push-comment" ]; then cmd="push"; shift; fi
 while [ $# -gt 0 ]; do
   case "$1" in
+    --comment)         event="comment"; shift ;;
+    --approve)         event="approve"; shift ;;
+    --request-changes) event="request-changes"; shift ;;
+    -f|--file)         out="${2:?missing value for $1}"; shift 2 ;;
+    --regenerate)      regen=1; shift ;;
+    -e|--edit)         edit=1; shift ;;
+    -y|--yes)          yes=1; shift ;;
+    -a|--account) account="${2:?missing value for $1}"; shift 2 ;;
+    --accounts) list_accounts=1; shift ;;
     -R|--repo)  repo="${2:?missing value for $1}"; shift 2 ;;
     -p|--print) mode="print"; shift ;;
     -o|--out)   out="${2:?missing value for $1}"; shift 2 ;;
@@ -61,6 +132,24 @@ while [ $# -gt 0 ]; do
     *)          [ -z "$pr" ] || die "only one PR at a time"; pr="$1"; shift ;;
   esac
 done
+
+if [ $list_accounts -eq 1 ]; then
+  pick_account
+  echo "Claude accounts (* = used here, via $claude_src):"
+  found=0
+  while IFS= read -r d; do
+    [ "$d" = "$claude_dir" ] && { mark="*"; found=1; } || mark=" "
+    if [ -e "$d/skills/pr-review/SKILL.md" ] && [ -e "$d/commands/review-pr.md" ]; then s="pr-review installed"; else s="not installed"; fi
+    printf " %s %-12s %-40s %s\n" "$mark" "$(account_name "$d")" "$d" "$s"
+  done < <(detect_accounts)
+  [ $found -eq 1 ] || echo " * $claude_dir (not detected as a Claude config dir)"
+  exit 0
+fi
+
+if [ "$cmd" = "review" ] && [ $clean -eq 0 ] && [ $list -eq 0 ]; then
+  pick_account
+  [ -d "$claude_dir" ] || die "Claude config dir not found: $claude_dir (from $claude_src). Log in first: CLAUDE_CONFIG_DIR=$claude_dir claude"
+fi
 
 command -v git >/dev/null || die "git not found"
 command -v gh  >/dev/null || die "gh (GitHub CLI) not found"
@@ -109,10 +198,11 @@ if [ $clean -eq 1 ]; then
   exit 0
 fi
 
-base=""; title=""
+base=""; title=""; state=""
 for c in "${candidates[@]}"; do
-  if info="$(gh pr view "$pr" --repo "$c" --json baseRefName,title -q '.baseRefName + "\t" + .title' 2>/dev/null)"; then
-    repo="$c"; base="${info%%$'\t'*}"; title="${info#*$'\t'}"; break
+  if info="$(gh pr view "$pr" --repo "$c" --json baseRefName,state,title -q '.baseRefName + "\t" + .state + "\t" + .title' 2>/dev/null)"; then
+    repo="$c"; base="${info%%$'\t'*}"; rest="${info#*$'\t'}"
+    state="${rest%%$'\t'*}"; title="${rest#*$'\t'}"; break
   fi
 done
 [ -n "$base" ] || die "PR #$pr not found in: ${candidates[*]} (use --repo OWNER/REPO)"
@@ -121,17 +211,98 @@ echo "→ $repo#$pr: $title (base: $base)"
 target="$repo#$pr"
 out="${out:-$OUT_DIR/$(echo "$repo" | tr '/' '-')-pr-$pr.md}"
 
-run_claude() {
+claude_env() { # select the Claude account and export it for child processes
   command -v "$CLAUDE_BIN" >/dev/null || die "$CLAUDE_BIN not found"
+  pick_account
+  [ -d "$claude_dir" ] || die "Claude config dir not found: $claude_dir (from $claude_src). Log in first: CLAUDE_CONFIG_DIR=$claude_dir claude"
+  if [ "$claude_dir" = "$HOME/.claude" ]; then
+    # Default account: leave CLAUDE_CONFIG_DIR unset; Claude then uses ~/.claude.json
+    # (setting it would move that file into the config dir and lose the login).
+    unset CLAUDE_CONFIG_DIR
+  else
+    export CLAUDE_CONFIG_DIR="$claude_dir"
+  fi
+  echo "→ Claude account: $(account_name "$claude_dir") ($claude_dir, via $claude_src)"
+}
+
+run_claude() {
+  claude_env
+  if [ ! -e "$claude_dir/skills/pr-review/SKILL.md" ] && [ ! -e ".claude/skills/pr-review/SKILL.md" ]; then
+    echo "  ! pr-review is not installed for this account. Run: install.sh --account $(account_name "$claude_dir")" >&2
+  fi
   if [ "$mode" = "print" ]; then
     mkdir -p "$(dirname "$out")"
     echo "→ Writing review to $out"
     "$CLAUDE_BIN" -p "/review-pr $target" > "$out"
     echo "Done: $out"
+    echo "Edit it if needed, then post with: review-pr push-comment $pr"
   else
     "$CLAUDE_BIN" "/review-pr $target"
   fi
 }
+
+EXPORT_PROMPT='Output the final version of the pull request review from this conversation, including every change I asked for during the session, as GitHub-flavored markdown ready to post as a PR review. Output only the review itself: no preamble, no closing remarks, no code fence around the whole review. Do not run any tools.'
+
+push_comment() {
+  if [ "$state" != "OPEN" ]; then
+    echo "! PR $target is $state."
+  fi
+
+  # 1. Get the review text.
+  if [ ! -s "$out" ] || [ $regen -eq 1 ]; then
+    [ -d "$wt" ] || die "No review file at $out and no review worktree at $wt.
+Run 'review-pr $pr' or 'review-pr -p $pr' first, or pass -f FILE."
+    claude_env
+    echo "→ Exporting the final review from your last Claude session in $wt"
+    mkdir -p "$(dirname "$out")"
+    (cd "$wt" && "$CLAUDE_BIN" -c -p "$EXPORT_PROMPT") > "$out.tmp" \
+      || { rm -f "$out.tmp"; die "export from Claude session failed"; }
+    [ -s "$out.tmp" ] || { rm -f "$out.tmp"; die "Claude returned an empty review"; }
+    mv "$out.tmp" "$out"
+    echo "→ Saved to $out"
+  fi
+
+  # 2. Optional edit.
+  if [ $edit -eq 1 ]; then
+    "${VISUAL:-${EDITOR:-vi}}" "$out" </dev/tty >/dev/tty
+  fi
+  [ -s "$out" ] || die "review file is empty: $out"
+
+  # 3. Show what will be posted.
+  verdict="$(grep -m1 -oE 'Request changes|Approve with comments|Approve' "$out" || true)"
+  echo
+  echo "  PR:      $target — $title"
+  echo "  Event:   $event"
+  echo "  File:    $out ($(wc -l < "$out" | tr -d ' ') lines)"
+  [ -n "$verdict" ] && echo "  Verdict: $verdict (from the review text)"
+  echo "  ---------------------------------------------"
+  head -n 15 "$out" | sed 's/^/  │ /'
+  [ "$(wc -l < "$out")" -gt 15 ] && echo "  │ ..."
+  echo "  ---------------------------------------------"
+  case "$event:$verdict" in
+    approve:"Request changes")      echo "! Posting an APPROVAL, but the review says 'Request changes'." ;;
+    request-changes:Approve*)       echo "! Requesting changes, but the review says '$verdict'." ;;
+    comment:"Request changes")      echo "  Tip: add --request-changes to block the merge." ;;
+  esac
+  if [ -e "$out.posted" ]; then
+    echo "! Already posted from this file: $(tail -n 1 "$out.posted")"
+  fi
+
+  # 4. Confirm and post.
+  if [ $yes -eq 0 ]; then
+    printf "Post this review to %s? [y/N] " "$target"
+    { read -r ans </dev/tty; } 2>/dev/null || { echo; die "no terminal to confirm; use --yes"; }
+    case "$ans" in y|Y|yes|YES) ;; *) echo "Not posted."; exit 1 ;; esac
+  fi
+  gh pr review "$pr" --repo "$repo" "--$event" --body-file "$out"
+  echo "$(date '+%Y-%m-%d %H:%M') --$event" >> "$out.posted"
+  echo "Posted: $(gh pr view "$pr" --repo "$repo" --json url -q .url)"
+}
+
+if [ "$cmd" = "push" ]; then
+  push_comment
+  exit 0
+fi
 
 if [ $here -eq 1 ]; then
   run_claude
@@ -163,4 +334,6 @@ if [ -n "$setup" ]; then
 fi
 run_claude
 echo
-echo "Worktree kept at $wt. Remove with: review-pr --clean $pr"
+echo "Worktree kept at $wt."
+echo "  Post the review:  review-pr push-comment $pr [--approve|--request-changes]"
+echo "  Remove worktree:  review-pr --clean $pr"

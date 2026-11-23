@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# review-pr: check out a GitHub PR in an isolated git worktree and review it
+# with Claude Code. Fork-aware: PRs are looked up in `upstream` first, then `origin`.
+set -euo pipefail
+
+CLAUDE_BIN="${CLAUDE_BIN:-claude}"
+OUT_DIR="${REVIEW_PR_OUT_DIR:-$HOME/pr-reviews}"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  review-pr <pr>              Review interactively in a worktree
+  review-pr -p <pr> [-o FILE] Non-interactive; write review to a file
+  review-pr --here <pr>       Review from the current checkout (no worktree)
+  review-pr --clean <pr>      Remove the worktree and refs for <pr>
+  review-pr --list            List open PRs in the resolved repo
+
+<pr> is a number, owner/repo#number, or a GitHub PR URL.
+
+Options:
+  -R, --repo OWNER/REPO   Repo that owns the PR (default: upstream remote, else origin)
+  -p, --print             Non-interactive (claude -p); output goes to a file
+  -o, --out FILE          Output file for -p (default: ~/pr-reviews/<owner>-<repo>-pr-<n>.md)
+      --here              Don't create a worktree; review using gh pr diff
+      --setup CMD         Run CMD in the worktree before reviewing (e.g. "npm ci")
+  -h, --help              Show this help
+
+Env: CLAUDE_BIN (default: claude), REVIEW_PR_OUT_DIR (default: ~/pr-reviews)
+USAGE
+}
+
+die() { echo "review-pr: $*" >&2; exit 1; }
+
+slug_of_remote() {
+  git remote get-url "$1" 2>/dev/null \
+    | sed -E 's#^(git@[^:]+:|ssh://[^/]+/|https?://[^/]+/)##; s#\.git$##; s#/$##'
+}
+
+remote_for_slug() {
+  local r
+  for r in $(git remote); do
+    if [ "$(slug_of_remote "$r" | tr 'A-Z' 'a-z')" = "$(echo "$1" | tr 'A-Z' 'a-z')" ]; then
+      echo "$r"; return 0
+    fi
+  done
+  return 1
+}
+
+repo=""; pr=""; mode="interactive"; out=""; here=0; clean=0; list=0; setup=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -R|--repo)  repo="${2:?missing value for $1}"; shift 2 ;;
+    -p|--print) mode="print"; shift ;;
+    -o|--out)   out="${2:?missing value for $1}"; shift 2 ;;
+    --here)     here=1; shift ;;
+    --clean)    clean=1; shift ;;
+    --list)     list=1; shift ;;
+    --setup)    setup="${2:?missing value for $1}"; shift 2 ;;
+    -h|--help)  usage; exit 0 ;;
+    -*)         die "unknown option: $1 (see --help)" ;;
+    *)          [ -z "$pr" ] || die "only one PR at a time"; pr="$1"; shift ;;
+  esac
+done
+
+command -v git >/dev/null || die "git not found"
+command -v gh  >/dev/null || die "gh (GitHub CLI) not found"
+git rev-parse --git-dir >/dev/null 2>&1 || die "run this inside a git repository"
+
+# Parse PR argument forms.
+case "$pr" in
+  http*://*/pull/*)
+    repo="$(echo "$pr" | sed -E 's#^https?://[^/]+/([^/]+/[^/]+)/pull/.*#\1#')"
+    pr="$(echo "$pr" | sed -E 's#.*/pull/([0-9]+).*#\1#')" ;;
+  */*\#*)
+    repo="${pr%%#*}"; pr="${pr##*#}" ;;
+esac
+if [ $list -eq 0 ]; then
+  [ -n "$pr" ] || { usage; exit 1; }
+  [[ "$pr" =~ ^[0-9]+$ ]] || die "invalid PR number: $pr"
+fi
+
+# Resolve repo: explicit > upstream > origin.
+candidates=()
+if [ -n "$repo" ]; then
+  candidates=("$repo")
+else
+  for r in upstream origin; do
+    s="$(slug_of_remote "$r" || true)"
+    [ -n "$s" ] && candidates+=("$s")
+  done
+  [ ${#candidates[@]} -gt 0 ] || die "no upstream/origin remote; pass --repo OWNER/REPO"
+fi
+
+if [ $list -eq 1 ]; then
+  echo "Open PRs in ${candidates[0]}:"
+  exec gh pr list --repo "${candidates[0]}"
+fi
+
+root="$(git rev-parse --show-toplevel)"
+wt="$(dirname "$root")/$(basename "$root")-review-pr-$pr"
+ref_head="refs/review/pr-$pr/head"
+ref_base="refs/review/pr-$pr/base"
+
+if [ $clean -eq 1 ]; then
+  if [ -d "$wt" ]; then git worktree remove --force "$wt" && echo "Removed $wt"; fi
+  git update-ref -d "$ref_head" 2>/dev/null || true
+  git update-ref -d "$ref_base" 2>/dev/null || true
+  git worktree prune
+  exit 0
+fi
+
+base=""; title=""
+for c in "${candidates[@]}"; do
+  if info="$(gh pr view "$pr" --repo "$c" --json baseRefName,title -q '.baseRefName + "\t" + .title' 2>/dev/null)"; then
+    repo="$c"; base="${info%%$'\t'*}"; title="${info#*$'\t'}"; break
+  fi
+done
+[ -n "$base" ] || die "PR #$pr not found in: ${candidates[*]} (use --repo OWNER/REPO)"
+echo "→ $repo#$pr: $title (base: $base)"
+
+target="$repo#$pr"
+out="${out:-$OUT_DIR/$(echo "$repo" | tr '/' '-')-pr-$pr.md}"
+
+run_claude() {
+  command -v "$CLAUDE_BIN" >/dev/null || die "$CLAUDE_BIN not found"
+  if [ "$mode" = "print" ]; then
+    mkdir -p "$(dirname "$out")"
+    echo "→ Writing review to $out"
+    "$CLAUDE_BIN" -p "/review-pr $target" > "$out"
+    echo "Done: $out"
+  else
+    "$CLAUDE_BIN" "/review-pr $target"
+  fi
+}
+
+if [ $here -eq 1 ]; then
+  run_claude
+  exit 0
+fi
+
+# Fetch PR head and base into private refs (works for fork PRs, no gh checkout needed).
+remote="$(remote_for_slug "$repo" || true)"
+if [ -z "$remote" ]; then
+  remote="$(gh repo view "$repo" --json url -q .url).git"
+fi
+echo "→ Fetching PR head and $base from $remote"
+git fetch --no-tags --quiet "$remote" \
+  "+refs/pull/$pr/head:$ref_head" \
+  "+refs/heads/$base:$ref_base"
+
+if [ -d "$wt" ]; then
+  echo "→ Updating existing worktree $wt"
+  git -C "$wt" checkout --quiet --detach "$ref_head"
+else
+  echo "→ Creating worktree $wt"
+  git worktree add --quiet --detach "$wt" "$ref_head"
+fi
+
+cd "$wt"
+if [ -n "$setup" ]; then
+  echo "→ Running setup: $setup"
+  bash -c "$setup"
+fi
+run_claude
+echo
+echo "Worktree kept at $wt. Remove with: review-pr --clean $pr"
